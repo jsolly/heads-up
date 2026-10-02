@@ -1,0 +1,23 @@
+{
+ "_comment": "Copy to config.local.json (gitignored) and fill in your private shore pin.",
+ "pin": {
+  "lat": null,
+  "lon": null
+ },
+ "bbox": [
+  [
+   [
+    39.7,
+    -75.55
+   ],
+   [
+    40.15,
+    -74.7
+   ]
+  ]
+ ],
+ "message_types": [
+  "PositionReport",
+  "ShipStaticData"
+ ]
+}

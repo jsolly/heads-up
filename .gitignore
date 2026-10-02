@@ -1,0 +1,22 @@
+# private / runtime -- never commit
+config.local.json
+state.json
+state.json.tmp
+state.bad-*
+heartbeat.json
+heartbeat.json.tmp
+*.log
+*.log.*
+pending-events.jsonl
+events.jsonl
+*.pid
+maps/
+photos/
+cargo/
+.env
+.env.*
+*.env
+env/
+.venv/
+__pycache__/
+*.pyc
