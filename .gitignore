@@ -31,3 +31,4 @@ sky/observations.jsonl
 **/process.lock
 
 **/*.tmp
+**/delivery.sqlite*

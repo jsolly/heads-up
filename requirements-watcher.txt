@@ -1,0 +1,4 @@
+# Persistent producer only; maps use the complete requirements.txt.
+websockets>=15,<18
+requests>=2.28
+skyfield>=1.49,<2
