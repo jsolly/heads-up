@@ -1,4 +1,4 @@
-#!/workspace/mapenv/bin/python
+#!/usr/bin/env python3
 """Draw an end-to-end voyage map for a ship the watcher knows about.
 
     /workspace/mapenv/bin/python route_map.py <MMSI> [--from LOCODE] [--to LOCODE] [--out path]

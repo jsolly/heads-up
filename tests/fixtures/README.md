@@ -1,0 +1,3 @@
+These compact SPK excerpts contain public NASA/JPL DE421 planetary ephemeris coefficients, used as data by Skyfield. Source: https://ssd.jpl.nasa.gov/ftp/eph/planets/bsp/de421.bsp . Generated with `python -m jplephem excerpt START END de421.bsp OUTPUT` for eclipse (2026-08-27–31), meteors (2026-10-20–25), moon (2026-12-22–28), and ISS (2026-10-01–08). They are scientific data, not vendored runtime code.
+
+`iss.tle` is the public Celestrak NORAD 25544 element set with epoch 2026-10-02T20:27:49Z, from https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=TLE . Tests fix both observation time and cache modification time; they forbid network calls. Observer coordinates are public city/river locations.

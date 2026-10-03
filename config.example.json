@@ -1,23 +1,30 @@
 {
- "_comment": "Copy to config.local.json (gitignored) and fill in your private shore pin.",
- "pin": {
-  "lat": null,
-  "lon": null
- },
- "bbox": [
-  [
-   [
-    39.7,
-    -75.55
-   ],
-   [
-    40.15,
-    -74.7
-   ]
-  ]
- ],
- "message_types": [
-  "PositionReport",
-  "ShipStaticData"
- ]
+  "_comment": "Copy to config.local.json (gitignored) and fill in your private shore pin.",
+  "pin": {
+    "lat": null,
+    "lon": null
+  },
+  "bbox": [
+    [
+      [
+        38.75,
+        -75.65
+      ],
+      [
+        40.25,
+        -74.65
+      ]
+    ]
+  ],
+  "message_types": [
+    "PositionReport",
+    "ShipStaticData"
+  ],
+  "sky": {
+    "enabled": true,
+    "sunrise_threshold": 65,
+    "sunset_threshold": 75,
+    "max_cloud_cover": 30,
+    "min_visibility_m": 10000
+  }
 }

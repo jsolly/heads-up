@@ -6,3 +6,6 @@ cartopy>=0.22
 matplotlib>=3.7
 shapely>=2.0
 pyproj>=3.5
+
+# sky/astronomy.py
+skyfield>=1.49,<2

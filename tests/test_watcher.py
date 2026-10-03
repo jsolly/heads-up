@@ -1,4 +1,4 @@
-"""Unit tests. Run: python3 -m unittest discover -s tests -v   (needs config.local.json for the pin)."""
+"""Unit tests. Run: python3 -m unittest discover -s tests -v"""
 import json
 import sys
 import tempfile
@@ -7,16 +7,17 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
-import watcher as W  # noqa: E402
+from ships import watcher as W  # noqa: E402
 
-HAVE_CFG = (HERE / "config.local.json").exists()
+TEST_PIN = (39.9535, -75.1320)  # public channel waypoint, never a private location
 
 
-@unittest.skipUnless(HAVE_CFG, "config.local.json (pin) missing")
 class AlongToPin(unittest.TestCase):
     def setUp(self):
-        cfg = json.loads((HERE / "config.local.json").read_text())
-        self.plat, self.plon = cfg["pin"]["lat"], cfg["pin"]["lon"]
+        self.plat, self.plon = TEST_PIN
+        self.old_pin = W._PIN
+        W._PIN = W.project_on_channel(*TEST_PIN)["s"]
+        self.addCleanup(setattr, W, "_PIN", self.old_pin)
 
     def test_points(self):
         tinicum = W.along_to_pin(39.8545, -75.2650)
@@ -62,15 +63,18 @@ class AvgSog(unittest.TestCase):
         self.assertIsNone(W.avg_sog([]))
 
 
-@unittest.skipUnless(HAVE_CFG, "config.local.json (pin) missing")
 class Transit(unittest.TestCase):
     """Synthetic AIS messages through the event engine (no network)."""
 
     def setUp(self):
+        old_pin = W._PIN
+        W._PIN = W.project_on_channel(*TEST_PIN)["s"]
+        self.addCleanup(setattr, W, "_PIN", old_pin)
         self.tmp = tempfile.TemporaryDirectory()
         t = Path(self.tmp.name)
         for name, fn in [("STATE_PATH", "state.json"), ("HEARTBEAT_PATH", "hb.json"),
                          ("PENDING_PATH", "p.jsonl"), ("EVENTS_PATH", "e.jsonl")]:
+            self.addCleanup(setattr, W, name, getattr(W, name))
             setattr(W, name, t / fn)
         self.events = []
         outer = self
@@ -164,14 +168,40 @@ class Transit(unittest.TestCase):
             self.pos(t + 600 + k * 120, 39.8995, -75.1320, 0.0, 10)
         self.assertEqual(len(self.events), n)
 
+    def test_sparse_coverage_and_global_outage_stay_quiet(self):
+        self.static()
+        t = self.run_track(self.channel_track(10, 16))
+        self.pos(t + 46 * 60, 39.8, -75.41, 5, 0, mmsi=222222222)
+        self.w.periodic(now=t + 46 * 60)
+        self.w.periodic(now=t + 100 * 60)  # no stream-wide data
+        self.pos(t + 101 * 60, 39.8, -75.41, 5, 0, mmsi=222222222)
+        self.w.periodic(now=t + 101 * 60)  # coverage recovery starts fresh evidence
+        self.assertNotIn("lost_signal", [e["event"] for e in self.events])
+
     def test_lost_signal(self):
         self.static()
         t = self.run_track(self.channel_track(10, 16))
-        self.w.periodic(now=t + 46 * 60)
-        self.w.periodic(now=t + 50 * 60)
+        for minute in range(1, 96):
+            self.pos(t + minute * 60, 39.8, -75.41, 5, 0, mmsi=222222222)
+            self.w.periodic(now=t + minute * 60)
         kinds = [e["event"] for e in self.events]
         self.assertEqual(kinds.count("lost_signal"), 1)
+        self.pos(t + 96 * 60, 39.856, -75.243, 10, 80)
+        self.assertTrue(self.w.state["ships"]["123456789"]["transit"]["signal_back"])
 
+
+class Policy(unittest.TestCase):
+    def test_bbox_covers_every_waypoint(self):
+        (south, west), (north, east) = W.DEFAULT_BBOX[0]
+        for lat, lon, _ in W.CHANNEL:
+            self.assertTrue(south <= lat <= north and west <= lon <= east)
+
+    def test_notification_boundaries_and_dst(self):
+        from datetime import datetime
+        for date in ('2026-07-01', '2026-11-01'):
+            for clock, expected in [('05:14', False), ('05:15', True), ('21:30', True), ('21:31', False)]:
+                ts = datetime.fromisoformat(date + 'T' + clock).replace(tzinfo=W.ET).timestamp()
+                self.assertEqual(W.in_notify_window(ts), expected)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
