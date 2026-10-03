@@ -1,0 +1,17 @@
+# Box migration and recovery
+
+The current live platform and its boot/routine APIs have not yet been identified. A supervisor alone does not survive a destroyed filesystem or a platform rollback. Installation, routine edits, credentials and a reboot test remain live acceptance gates.
+
+## Migration
+
+Before installing the new revision, back up the old river-rubber-necker workspace, its gitignored config/env, ship state, event/pending logs, cargo, maps and photos to a platform-persistent private home. Stop the old supervisor using its old stop command and verify both old processes exited. Install a reviewed, pinned HeadsUp revision into the new heads-up workspace. Recreate the Python environment from requirements.txt. Keep config.local.json and .env.local in the repo root with permissions 0600. Move ship runtime state.json, heartbeat.json, pending-events.jsonl, events.jsonl, watcher logs, cargo/, photos/ and maps/ into ships/. Preserve the state content and active transits; do not overwrite it with a blank template. Retain the old backup until restart and event behavior are verified.
+
+Rename both injected and root .env.local DELAWARE_WEBHOOK_URL and DELAWARE_WEBHOOK_KEY to HEADSUP_WEBHOOK_URL and HEADSUP_WEBHOOK_KEY. Preserve AISSTREAM_API_KEY. Replace the existing bbox override with the new example bbox or remove it to select the built-in full-channel default. An old narrow explicit bbox still overrides the default. Run the test suite, start ensure-running.sh, then inspect ships/heartbeat.json and sky/heartbeat.json and test webhook routing with an explicitly authorized test message.
+
+Rename the routine "Delaware ship events" to "HeadsUp events" and point it to the operations contract. Replace river-rubber-necker/watcher paths with heads-up/ships paths and use heads-up/sky paths for sky state. The 05:43/12:43 health checks must invoke the new root ensure-running.sh and inspect both heartbeats. Preserve existing cadence and quiet-on-healthy behavior; keep webhook secrets platform-injected.
+
+## Reboot and rollback recovery
+
+Preferred: use a platform boot hook that mounts persistent private config and starts the pinned installed HeadsUp checkout. If boot hooks are unavailable, an external platform health routine must restore the missing pinned checkout and environment, then run ensure-running.sh. That routine and its secrets must live outside the rollback domain. Re-cloning inside a wiped workspace cannot recover a wiped deploy key. Give the routine read-only repository access via platform secrets, never a committed key. Use a pinned release archive, verify its digest before unpacking, and refuse to overwrite a surviving workspace or its state. Provision private root config from the persistent secret store. Install dependencies before launch. These are platform-specific operations; this repo does not pretend they have been installed.
+
+Acceptance: two concurrent ensure-running calls yield the same supervisor; child exit restarts only that child; stop terminates both; reboot starts without manual shell work; missing-checkout rollback restores pinned code with private config intact; both heartbeats are fresh; one authorized event reaches the handler exactly once. Offline supervisor tests cover the first three. Only live proof closes reboot/rollback acceptance.

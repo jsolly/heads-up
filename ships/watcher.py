@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""River Rubber Necker: no-AI Delaware River big-ship watcher.
+"""HeadsUp: no-AI Delaware River big-ship watcher.
 
 Subscribes to the AISStream websocket for a Delaware River bounding box, keeps
 per-vessel state, projects each big commercial ship onto a channel polyline,
@@ -26,21 +26,21 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
-ET = ZoneInfo("America/New_York")
+sys.path.insert(0, str(HERE.parent))
+from runtime import (ET, CONFIG_PATH, ENV_FILE, ALERT_WINDOW, load_config, in_notify_window,
+                     now_et, iso_et, hhmm_et, atomic_write_json, append_jsonl, read_env_file,
+                     webhook_config, aisstream_key)
 
-CONFIG_PATH = HERE / "config.local.json"
 STATE_PATH = HERE / "state.json"
 HEARTBEAT_PATH = HERE / "heartbeat.json"
 LOG_PATH = HERE / "watcher.log"
 PENDING_PATH = HERE / "pending-events.jsonl"
 EVENTS_PATH = HERE / "events.jsonl"
-ENV_FILE = HERE / ".env.local"  # optional, gitignored; re-read at send time
 
 WS_URL = "wss://stream.aisstream.io/v0/stream"
-DEFAULT_BBOX = [[[39.7, -75.55], [40.15, -74.7]]]
+DEFAULT_BBOX = [[[38.75, -75.65], [40.25, -74.65]]]
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -65,7 +65,7 @@ T60_MIN = 60
 T30_MIN = 30
 ETA_SHIFT_MIN = 15
 ETA_SHIFT_COOLDOWN_S = 10 * 60
-LOST_SIGNAL_S = 45 * 60
+LOST_SIGNAL_S = 90 * 60
 MAX_LATERAL_NM = 1.2        # farther than this from the channel = not in the river channel
 TURNED_AWAY_S = 10 * 60
 TURNED_AWAY_NM = 0.5
@@ -77,7 +77,6 @@ HEARTBEAT_S = 30
 WS_SILENT_RECONNECT_S = 300
 WS_FAILS_FOR_ERROR = 5
 WATCHER_ERROR_COOLDOWN_S = 2 * 3600
-ALERT_WINDOW = (5, 20)      # ET hours; only used for a note, never suppresses events
 
 # ---------------------------------------------------------------------------
 # Delaware River channel polyline, bay mouth -> Trenton (lat, lon, label).
@@ -178,13 +177,8 @@ def project_on_channel(lat, lon):
 _PIN = None
 
 
-def load_config():
-    if not CONFIG_PATH.exists():
-        raise SystemExit(f"missing {CONFIG_PATH.name}; copy config.example.json and fill in the pin")
-    cfg = json.loads(CONFIG_PATH.read_text())
-    if not cfg.get("pin") or cfg["pin"].get("lat") is None:
-        raise SystemExit("config.local.json has no pin")
-    return cfg
+
+
 
 
 def pin_s():
@@ -233,55 +227,20 @@ def ang_diff(a, b):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def now_et():
-    return datetime.now(ET)
 
 
-def iso_et(ts=None):
-    dt = datetime.fromtimestamp(ts, ET) if ts is not None else now_et()
-    return dt.isoformat(timespec="seconds")
 
 
-def hhmm_et(ts):
-    return datetime.fromtimestamp(ts, ET).strftime("%H:%M")
 
 
-def atomic_write_json(path: Path, obj):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=1, default=str))
-    os.replace(tmp, path)
 
 
-def append_jsonl(path: Path, obj):
-    with open(path, "a") as f:
-        f.write(json.dumps(obj, default=str) + "\n")
 
 
-def read_env_file():
-    out = {}
-    try:
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip().removeprefix("export ").strip()
-            out[k] = v.strip().strip('"').strip("'")
-    except FileNotFoundError:
-        pass
-    return out
 
 
-def webhook_config():
-    """(url, key) from env DELAWARE_WEBHOOK_URL / DELAWARE_WEBHOOK_KEY, then .env.local."""
-    filev = read_env_file()
-    url = os.environ.get("DELAWARE_WEBHOOK_URL") or filev.get("DELAWARE_WEBHOOK_URL")
-    key = os.environ.get("DELAWARE_WEBHOOK_KEY") or filev.get("DELAWARE_WEBHOOK_KEY")
-    return url, key
 
 
-def aisstream_key():
-    return os.environ.get("AISSTREAM_API_KEY") or read_env_file().get("AISSTREAM_API_KEY")
 
 
 def is_qualifying(static):
@@ -342,7 +301,7 @@ def send_now(payload, attempts=3):
         try:
             r = requests.post(url, json=payload, timeout=15,
                               headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                                       "User-Agent": "river-rubber-necker/1.0"})
+                                       "User-Agent": "heads-up/1.0"})
             if 200 <= r.status_code < 300:
                 log.info("event %s %s sent (HTTP %s)", payload.get("event"), payload.get("name"), r.status_code)
                 return True, f"HTTP {r.status_code}"
@@ -367,8 +326,10 @@ class Watcher:
         self.lock = threading.RLock()
         self.state = self._load_state()
         self.last_msg = 0.0
+        self.stream_resumed_t = 0.0
         self.msgs_total = 0
         self.connected = False
+        self.ws_open_t = 0.0
         self.ws = None
         self.stop = threading.Event()
         self.fail_times: list[float] = []
@@ -431,6 +392,8 @@ class Watcher:
         if "error" in msg and "MessageType" not in msg:
             log.error("AISStream error message: %s", str(msg.get("error"))[:200])
             return
+        if not self.last_msg or now - self.last_msg >= WS_SILENT_RECONNECT_S:
+            self.stream_resumed_t = now
         self.last_msg = now
         self.msgs_total += 1
         mtype = msg.get("MessageType")
@@ -660,12 +623,13 @@ class Watcher:
                 age = now - sh.get("last_t", now)
                 tr = sh.get("transit")
                 if tr and not tr.get("closed"):
-                    if (age >= LOST_SIGNAL_S and "lost_signal" not in tr["sent"] and not tr.get("stopped")):
+                    if (now - max(sh.get("last_t", now), self.stream_resumed_t) >= LOST_SIGNAL_S and "lost_signal" not in tr["sent"] and not tr.get("stopped")
+                            and self.last_msg and now - self.last_msg < WS_SILENT_RECONNECT_S):
                         static = self.state["static"].get(mmsi) or {}
                         tr["lost_signal_t"] = now
                         self.fire("lost_signal", mmsi, sh, static, sh["last"], now,
                                   extra_notes=[f"no AIS for {age/60:.0f} min; last fix {hhmm_et(sh['last_t'])} ET; "
-                                               "keeping last-known ETA"],
+                                               "AIS coverage may be patchy; position and ETA are unconfirmed"],
                                   use_fix_time=True)
                     if age >= STALE_CLOSE_S:
                         tr["closed"] = "stale"
@@ -693,11 +657,11 @@ class Watcher:
             if any(nd.startswith(x) for x in SOUTH_OF_PIN_DEST):
                 all_notes.append(f"destination {dest} - may stop at a berth before the pin")
         if eta_t and event != "passed":
-            h = datetime.fromtimestamp(eta_t, ET).hour
-            if not (ALERT_WINDOW[0] <= h < ALERT_WINDOW[1]):
-                all_notes.append("pass ETA is outside the 05:00-20:00 ET window")
+            if not in_notify_window(eta_t):
+                all_notes.append("pass ETA is outside the 05:15-21:30 ET window")
         return {
             "event": event,
+            "notify": in_notify_window(now),
             "ts": iso_et(now),
             "mmsi": int(mmsi) if str(mmsi).isdigit() else mmsi,
             "imo": (static or {}).get("imo"),
@@ -743,7 +707,7 @@ class Watcher:
         meta["last_watcher_error_t"] = now
         self.dirty = True
         self.save(force=True)
-        payload = {"event": "watcher_error", "ts": iso_et(now), "mmsi": None, "imo": None, "name": None,
+        payload = {"event": "watcher_error", "notify": in_notify_window(now), "ts": iso_et(now), "mmsi": None, "imo": None, "name": None,
                    "callsign": None, "length": None, "type_code": None, "destination": None, "lat": None,
                    "lon": None, "sog": None, "cog": None, "eta_et": None, "minutes_out": None, "notes": detail}
         log.error("EVENT watcher_error: %s", detail)
@@ -788,10 +752,7 @@ class Watcher:
         cfg = load_config()
         bbox = cfg.get("bbox")
         if not bbox:
-            try:
-                bbox = json.loads((HERE.parent / "aisstream-bbox.json").read_text())["BoundingBoxes"]
-            except Exception:
-                bbox = DEFAULT_BBOX
+            bbox = DEFAULT_BBOX
         return {"APIKey": aisstream_key(), "BoundingBoxes": bbox,
                 "FilterMessageTypes": cfg.get("message_types") or ["PositionReport", "ShipStaticData"]}
 
@@ -809,6 +770,7 @@ class Watcher:
 
             def on_open(ws):
                 self.connected = True
+                self.ws_open_t = time.time()
                 ws.send(json.dumps(self.subscription()))
                 log.info("websocket open; subscribed")
 
@@ -860,9 +822,9 @@ class Watcher:
                     self.periodic(now)
                     last_periodic = now
                 self.save()
-                if (self.connected and self.last_msg and now - self.last_msg > WS_SILENT_RECONNECT_S
+                if (self.connected and now - max(self.last_msg, self.ws_open_t) > WS_SILENT_RECONNECT_S
                         and self.ws is not None):
-                    log.warning("no AIS for %ds; forcing reconnect", now - self.last_msg)
+                    log.warning("no AIS for %ds; forcing reconnect", now - max(self.last_msg, self.ws_open_t))
                     self.ws.close()
             except Exception:
                 log.exception("watchdog error")
@@ -888,10 +850,10 @@ def main():
     setup_logging(stderr=not args.test)
 
     if args.test:
-        payload = {"event": "test", "ts": iso_et(), "mmsi": 0, "imo": None, "name": "TEST SHIP",
+        payload = {"event": "test", "notify": in_notify_window(time.time()), "ts": iso_et(), "mmsi": 0, "imo": None, "name": "TEST SHIP",
                    "callsign": None, "length": 200, "type_code": 70, "destination": "USPHL", "lat": None,
                    "lon": None, "sog": 10.0, "cog": 20.0, "eta_et": now_et().strftime("%H:%M"), "minutes_out": 0,
-                   "notes": "river-rubber-necker webhook test"}
+                   "notes": "heads-up webhook test"}
         ok, detail = send_now(payload, attempts=1)
         print(json.dumps({"ok": ok, "detail": detail}))
         return 0 if ok else 1

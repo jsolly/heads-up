@@ -20,3 +20,14 @@ env/
 .venv/
 __pycache__/
 *.pyc
+control.sock
+supervisor.lock
+sky/cache/
+sky/state.json*
+sky/forecast.json*
+sky/candidates.jsonl
+sky/observations.jsonl
+
+**/process.lock
+
+**/*.tmp

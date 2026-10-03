@@ -1,0 +1,29 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+      - run: python -m compileall -q ships sky supervisor.py child_runner.py runtime.py
+  ci:
+    if: always()
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Require every test matrix job
+        env:
+          RESULT: ${{ needs.tests.result }}
+        run: test "$RESULT" = success
