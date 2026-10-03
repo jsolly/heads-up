@@ -50,6 +50,10 @@ class Supervision(unittest.TestCase):
             finally:
                 self.assertEqual(cli('stop').returncode, 0)
                 self.assertFalse((root / 'control.sock').exists())
+            child_output = (root / 'ships/supervisor.log').read_text()
+            self.assertNotIn('Fatal Python error', child_output)
+            self.assertNotIn('_enter_buffered_busy', child_output)
+            self.assertEqual(child_output, '')
 
     def test_concurrent_start_child_restart_and_safe_stop(self):
         with tempfile.TemporaryDirectory(prefix='hu-', dir='/private/tmp' if sys.platform == 'darwin' else '/tmp') as temp:
