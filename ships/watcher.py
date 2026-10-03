@@ -8,8 +8,8 @@ lost_signal, watcher_error) to a webhook as the ship approaches a private shore
 pin. The pin coordinates live ONLY in config.local.json (gitignored).
 
 Usage:
-    python3 watcher.py            # run forever
-    python3 watcher.py --test     # send one test event and exit
+    python3 ships/watcher.py            # run forever
+    python3 ships/watcher.py --test     # send one test event and exit
 """
 from __future__ import annotations
 
@@ -19,11 +19,12 @@ import logging
 import logging.handlers
 import math
 import os
-import queue
+import random
 import signal
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +33,8 @@ sys.path.insert(0, str(HERE.parent))
 from runtime import (ET, CONFIG_PATH, ENV_FILE, ALERT_WINDOW, load_config, in_notify_window,
                      now_et, iso_et, hhmm_et, atomic_write_json, append_jsonl, read_env_file,
                      webhook_config, aisstream_key)
+
+from delivery import Outbox, destinations
 
 STATE_PATH = HERE / "state.json"
 HEARTBEAT_PATH = HERE / "heartbeat.json"
@@ -270,51 +273,31 @@ def norm_dest(dest):
 # ---------------------------------------------------------------------------
 class Sender:
     def __init__(self):
-        self.q: queue.Queue = queue.Queue()
+        self.outbox = Outbox(HERE / 'delivery.sqlite')
         self.t = threading.Thread(target=self._run, name="sender", daemon=True)
         self.t.start()
 
     def submit(self, payload):
-        append_jsonl(EVENTS_PATH, payload)
-        self.q.put(payload)
+        ok, detail = self.outbox.publish(payload)
+        if not ok:
+            raise RuntimeError(detail)
 
     def _run(self):
         while True:
-            payload = self.q.get()
             try:
-                send_now(payload)
-            except Exception:  # never let the sender die
-                log.exception("sender crashed on %s", payload.get("event"))
+                self.outbox.drain(background=True)
+            except Exception as exc:
+                log.error("delivery unavailable: %s", type(exc).__name__)
+            time.sleep(5)
 
 
 def send_now(payload, attempts=3):
-    """POST one payload. Returns (ok, detail). Never raises for network errors."""
-    import requests
-
-    url, key = webhook_config()
-    if not url or not key:
-        append_jsonl(PENDING_PATH, {**payload, "_pending_reason": "webhook env not set"})
-        log.info("event %s %s queued locally (webhook not configured)", payload.get("event"), payload.get("name"))
-        return False, "webhook not configured; written to pending-events.jsonl"
-    err = None
-    for i in range(attempts):
-        try:
-            r = requests.post(url, json=payload, timeout=15,
-                              headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                                       "User-Agent": "heads-up/1.0"})
-            if 200 <= r.status_code < 300:
-                log.info("event %s %s sent (HTTP %s)", payload.get("event"), payload.get("name"), r.status_code)
-                return True, f"HTTP {r.status_code}"
-            err = f"HTTP {r.status_code}"
-            if 400 <= r.status_code < 500 and r.status_code not in (408, 429):
-                break
-        except Exception as e:  # noqa: BLE001
-            err = type(e).__name__
-        time.sleep([5, 20, 0][min(i, 2)])
-    append_jsonl(PENDING_PATH, {**payload, "_pending_reason": f"send failed: {err}"})
-    log.warning("event %s %s NOT sent (%s); saved to pending-events.jsonl", payload.get("event"),
-                payload.get("name"), err)
-    return False, err
+    """Explicit CLI test; ordinary events are published before asynchronous retry."""
+    outbox = Outbox(HERE / 'delivery.sqlite')
+    try:
+        return outbox.deliver(payload)
+    finally:
+        outbox.close()
 
 
 # ---------------------------------------------------------------------------
@@ -329,11 +312,13 @@ class Watcher:
         self.stream_resumed_t = 0.0
         self.msgs_total = 0
         self.connected = False
+        self.compression_enabled = False
         self.ws_open_t = 0.0
         self.ws = None
         self.stop = threading.Event()
         self.fail_times: list[float] = []
         self.dirty = False
+        self.publish_pending()
         pin_s()  # validate config early
 
     # ---- persistence ----
@@ -382,6 +367,21 @@ class Watcher:
             atomic_write_json(STATE_PATH, self.state)
             self.dirty = False
 
+    def publish_pending(self):
+        """Replay durable publication intents before consuming new AIS updates."""
+        if not self.sender:
+            return
+        for key, payload in list(self.state.get('publication_pending', {}).items()):
+            self.sender.submit(payload)  # atomic outbox publication; may raise, preserving intent
+            del self.state['publication_pending'][key]
+            self.save(force=True)
+
+    def publish_event(self, payload):
+        self.state.setdefault('publication_pending', {})[payload['id']] = payload
+        self.dirty = True
+        self.save(force=True)  # marker + payload in the same atomic file
+        self.publish_pending()
+
     # ---- messages ----
     def handle_message(self, raw: str, now: float | None = None):
         now = now or time.time()
@@ -390,19 +390,20 @@ class Watcher:
         except Exception:
             return
         if "error" in msg and "MessageType" not in msg:
-            log.error("AISStream error message: %s", str(msg.get("error"))[:200])
+            log.error("AISStream rejected a message")
             return
-        if not self.last_msg or now - self.last_msg >= WS_SILENT_RECONNECT_S:
-            self.stream_resumed_t = now
-        self.last_msg = now
-        self.msgs_total += 1
         mtype = msg.get("MessageType")
         meta = msg.get("MetaData") or {}
         body = (msg.get("Message") or {}).get(mtype) or {}
         mmsi = str(meta.get("MMSI") or body.get("UserID") or "")
-        if not mmsi:
+        if not mmsi or mtype not in ('ShipStaticData', 'PositionReport',
+                'StandardClassBPositionReport', 'ExtendedClassBPositionReport') or body.get('Valid') is False:
             return
         with self.lock:
+            if not self.last_msg or now - self.last_msg >= WS_SILENT_RECONNECT_S:
+                self.stream_resumed_t = now
+            self.last_msg = now
+            self.msgs_total += 1
             if mtype == "ShipStaticData":
                 self._on_static(mmsi, meta, body)
             elif mtype in ("PositionReport", "StandardClassBPositionReport", "ExtendedClassBPositionReport"):
@@ -526,7 +527,7 @@ class Watcher:
             a = self.ship_avg_sog(sh, now)
             if a is None or a < UNDERWAY_KN:
                 return
-            tr = sh["transit"] = {"dir": d, "start_t": now, "sent": {}, "notes": []}
+            tr = sh["transit"] = {"id": str(uuid.uuid4()), "sequence": 0, "dir": d, "start_t": now, "sent": {}, "notes": []}
             minutes, eta_t, _ = self.eta(sh, fix, now)
             notes = []
             if minutes is not None and minutes <= T60_MIN:
@@ -535,9 +536,9 @@ class Watcher:
             if minutes is not None and minutes <= T30_MIN:
                 tr["sent"]["t30"] = "covered_by_new_ship"
                 notes.append("already inside 30 min")
-            self.fire("new_ship", mmsi, sh, static, fix, now, extra_notes=notes)
             tr["ref_eta"] = eta_t
             tr["ref_eta_t"] = now
+            self.fire("new_ship", mmsi, sh, static, fix, now, extra_notes=notes)
             return
 
         d_tr = tr["dir"]
@@ -600,25 +601,26 @@ class Watcher:
         if minutes <= T30_MIN and "t30" not in tr["sent"]:
             if "t60" not in tr["sent"]:
                 tr["sent"]["t60"] = "skipped_jumped_to_t30"
-            self.fire("t30", mmsi, sh, static, fix, now, extra_notes=resumed_note)
             tr["ref_eta"], tr["ref_eta_t"] = eta_t, now
+            self.fire("t30", mmsi, sh, static, fix, now, extra_notes=resumed_note)
             return
         if minutes <= T60_MIN and "t60" not in tr["sent"]:
-            self.fire("t60", mmsi, sh, static, fix, now, extra_notes=resumed_note)
             tr["ref_eta"], tr["ref_eta_t"] = eta_t, now
+            self.fire("t60", mmsi, sh, static, fix, now, extra_notes=resumed_note)
             return
         if "t60" in tr["sent"] and tr.get("ref_eta"):
             shift = (eta_t - tr["ref_eta"]) / 60.0
             if abs(shift) >= ETA_SHIFT_MIN and now - tr.get("ref_eta_t", 0) >= ETA_SHIFT_COOLDOWN_S:
                 n = [f"ETA {'later' if shift > 0 else 'earlier'} by {abs(shift):.0f} min "
                      f"(was {hhmm_et(tr['ref_eta'])})"] + resumed_note
-                self.fire("eta_shift", mmsi, sh, static, fix, now, extra_notes=n, repeatable=True)
                 tr["ref_eta"], tr["ref_eta_t"] = eta_t, now
+                self.fire("eta_shift", mmsi, sh, static, fix, now, extra_notes=n, repeatable=True)
 
     def periodic(self, now=None):
         """Lost-signal, stale and forget sweeps. Call every ~30-60s."""
         now = now or time.time()
         with self.lock:
+            self.publish_pending()
             for mmsi, sh in list(self.state["ships"].items()):
                 age = now - sh.get("last_t", now)
                 tr = sh.get("transit")
@@ -674,6 +676,7 @@ class Watcher:
             "lon": fix["lon"],
             "sog": fix["sog"],
             "cog": fix["cog"],
+            "eta_at": iso_et(eta_t) if eta_t else None,
             "eta_et": hhmm_et(eta_t) if eta_t else None,
             "minutes_out": round(minutes) if minutes is not None else None,
             "direction": "northbound" if d == 1 else "southbound" if d == -1 else "unknown",
@@ -691,13 +694,21 @@ class Watcher:
         elif tr is not None:
             tr["sent"].setdefault(event + "_count", 0)
             tr["sent"][event + "_count"] += 1
+        if tr is not None:
+            tr.setdefault('id', str(uuid.uuid4()))  # migrate pre-ledger active transits
+            tr['sequence'] = tr.get('sequence', 0) + 1
+            identity = f"ship:{tr['id']}:{tr['sequence']}"
+        else:
+            identity = f"ship:{uuid.uuid4()}"
         payload = self.build_payload(event, mmsi, sh, static, fix, now, extra_notes, minutes_override, use_fix_time)
+        eta_at = datetime.fromisoformat(payload['eta_at']).timestamp() if payload['eta_at'] else None
+        lifetime = 15 * 60 if event in ('t60', 't30', 'eta_shift', 'lost_signal') else 30 * 60
+        payload.update(id=identity, schema_version=1, useful_until=min(now + lifetime, eta_at)
+                       if eta_at and event not in ('passed', 'stopped_short') else now + lifetime)
         log.info("EVENT %s %s dir=%s dist=%.2fnm eta=%s min=%s", event, payload["name"], payload["direction"],
                  payload["dist_nm"], payload["eta_et"], payload["minutes_out"])
         self.dirty = True
-        self.save(force=True)  # persist BEFORE sending so a crash never repeats
-        if self.sender:
-            self.sender.submit(payload)
+        self.publish_event(payload)
 
     def fire_watcher_error(self, detail):
         meta = self.state["meta"]
@@ -706,13 +717,12 @@ class Watcher:
             return
         meta["last_watcher_error_t"] = now
         self.dirty = True
-        self.save(force=True)
         payload = {"event": "watcher_error", "notify": in_notify_window(now), "ts": iso_et(now), "mmsi": None, "imo": None, "name": None,
                    "callsign": None, "length": None, "type_code": None, "destination": None, "lat": None,
                    "lon": None, "sog": None, "cog": None, "eta_et": None, "minutes_out": None, "notes": detail}
         log.error("EVENT watcher_error: %s", detail)
-        if self.sender:
-            self.sender.submit(payload)
+        payload.update(id=f"error:{uuid.uuid4()}", schema_version=1, useful_until=now + 30 * 60)
+        self.publish_event(payload)
 
     # ---- heartbeat ----
     def heartbeat(self):
@@ -742,7 +752,9 @@ class Watcher:
                 "vessels_seen": len(self.state["ships"]),
                 "msgs_total": self.msgs_total,
                 "connected": self.connected,
-                "webhook_configured": bool(url and key),
+                "compression_enabled": self.compression_enabled,
+                "webhook_configured": bool(destinations()),
+                "delivery": self.sender.outbox.diagnostics() if hasattr(self.sender, "outbox") else {},
                 "pid": os.getpid(),
             }
         atomic_write_json(HEARTBEAT_PATH, hb)
@@ -756,53 +768,69 @@ class Watcher:
         return {"APIKey": aisstream_key(), "BoundingBoxes": bbox,
                 "FilterMessageTypes": cfg.get("message_types") or ["PositionReport", "ShipStaticData"]}
 
+    def reset_coverage(self):
+        with self.lock:
+            self.connected = False
+            self.compression_enabled = False
+            self.last_msg = 0
+            self.stream_resumed_t = time.time()
+
+    def consume_stream(self, ws, subscription):
+        """Subscribe immediately; confirm compression before treating AIS as coverage."""
+        self.reset_coverage()
+        self.ws_open_t = time.time()
+        ws.send(json.dumps(subscription))
+        confirmation = json.loads(ws.recv(timeout=3))
+        if (confirmation.get('MessageType') != 'SubscriptionConfirmation'
+                or confirmation.get('Message', {}).get('CompressionEnabled') is not True
+                or 'permessage-deflate' not in ws.response.headers.get('Sec-WebSocket-Extensions', '')):
+            raise RuntimeError('compressed subscription not confirmed')
+        with self.lock:
+            self.compression_enabled = True
+            self.connected = True
+        log.info('websocket subscribed with compression')
+        initial = self.msgs_total
+        while not self.stop.is_set():
+            try:
+                raw = ws.recv(timeout=5)
+            except TimeoutError:
+                continue
+            self.handle_message(raw)
+        return self.msgs_total - initial
+
     def run_ws_forever(self):
-        import websocket  # websocket-client
+        from websockets.sync.client import connect
 
         backoff = 5
         while not self.stop.is_set():
             if not aisstream_key():
-                log.error("AISSTREAM_API_KEY not in env; retrying in 60s")
-                self._note_fail("AISSTREAM_API_KEY missing")
+                log.error('AISSTREAM_API_KEY not in env; retrying in 60s')
+                self._note_fail('AISSTREAM_API_KEY missing')
                 self.stop.wait(60)
                 continue
-            got_msg = {"v": False}
-
-            def on_open(ws):
-                self.connected = True
-                self.ws_open_t = time.time()
-                ws.send(json.dumps(self.subscription()))
-                log.info("websocket open; subscribed")
-
-            def on_message(ws, m):
-                got_msg["v"] = True
-                self.handle_message(m)
-
-            def on_error(ws, e):
-                log.warning("websocket error: %s", type(e).__name__ if not isinstance(e, str) else e[:120])
-
-            def on_close(ws, code, reason):
-                self.connected = False
-                log.info("websocket closed code=%s reason=%s", code, (reason or "")[:120])
-
-            self.ws = websocket.WebSocketApp(WS_URL, on_open=on_open, on_message=on_message,
-                                             on_error=on_error, on_close=on_close)
-            started = time.time()
+            subscription = self.subscription()  # load before the 3s subscription deadline
+            started, initial = time.time(), self.msgs_total
             try:
-                self.ws.run_forever(ping_interval=30, ping_timeout=10)
-            except Exception as e:  # noqa: BLE001
-                log.warning("run_forever raised %s", type(e).__name__)
-            self.connected = False
+                with connect(WS_URL, compression='deflate', open_timeout=10, close_timeout=5,
+                             ping_interval=30, ping_timeout=10, max_queue=32) as ws:
+                    self.ws = ws
+                    self.consume_stream(ws, subscription)
+            except Exception as exc:
+                log.warning('websocket unavailable: %s', type(exc).__name__)
+            finally:
+                self.ws = None
+                self.reset_coverage()  # even a brief disconnect ends continuous evidence
             if self.stop.is_set():
                 break
-            if got_msg["v"] and time.time() - started > 120:
+            if self.msgs_total > initial and time.time() - started > 120:
                 backoff = 5
                 self.fail_times = []
             else:
-                self._note_fail("websocket closed without data")
+                self._note_fail('websocket closed without sustained AIS')
                 backoff = min(backoff * 2, 300)
-            log.info("reconnecting in %ss", backoff)
-            self.stop.wait(backoff)
+            delay = backoff * random.uniform(0.8, 1.2)
+            log.info('reconnecting in %.1fs', delay)
+            self.stop.wait(delay)
 
     def _note_fail(self, why):
         now = time.time()
@@ -854,6 +882,7 @@ def main():
                    "callsign": None, "length": 200, "type_code": 70, "destination": "USPHL", "lat": None,
                    "lon": None, "sog": 10.0, "cog": 20.0, "eta_et": now_et().strftime("%H:%M"), "minutes_out": 0,
                    "notes": "heads-up webhook test"}
+        payload.update(id=f"test:{uuid.uuid4()}", schema_version=1, useful_until=time.time() + 60)
         ok, detail = send_now(payload, attempts=1)
         print(json.dumps({"ok": ok, "detail": detail}))
         return 0 if ok else 1

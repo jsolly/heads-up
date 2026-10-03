@@ -141,6 +141,33 @@ class Transit(unittest.TestCase):
         self.assertIn("passed", kinds)
         self.assertEqual(self.events[0]["direction"], "southbound")
 
+    def test_shift_crash_persists_reference_with_publication_intent(self):
+        self.static()
+        now = self.run_track(self.channel_track(10, 16)) + 1000
+        ship = self.w.state['ships']['123456789']
+        transit = ship['transit']
+        transit['sent'].update(t60='test', t30='test')
+        transit.update(ref_eta=now + 3 * 3600, ref_eta_t=now - 1000)
+        self.w.eta = lambda *args: (10, now + 600, 10)
+        outer = self
+        class Crash:
+            def submit(self, payload):
+                outer.events.append(payload)
+                raise RuntimeError('crash after publication')
+        self.w.sender = Crash()
+        with self.assertRaises(RuntimeError):
+            self.w._evaluate('123456789', ship, self.w.state['static']['123456789'], ship['last'], now)
+        first = self.events[-1]
+        class Recover:
+            def submit(self, payload):
+                outer.events.append(payload)
+        self.w = W.Watcher(Recover())
+        self.w.eta = lambda *args: (10, now + 600, 10)
+        ship = self.w.state['ships']['123456789']
+        self.w._evaluate('123456789', ship, self.w.state['static']['123456789'], ship['last'], now)
+        shifts = [item for item in self.events if item['event'] == 'eta_shift']
+        self.assertEqual([item['id'] for item in shifts], [first['id'], first['id']])
+
     def test_small_tug_ignored(self):
         self.static(typ=52, length=215, name="OSG ATB")
         self.run_track(self.channel_track(10, 30))

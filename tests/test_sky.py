@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from sky.forecast import sample, sun_score, clear, HOURLY
 from sky.watcher import Engine, due, sun_events
 
@@ -58,7 +59,12 @@ class Alerts(unittest.TestCase):
         from unittest.mock import patch, Mock
         from sky.watcher import post
         self.engine.send = post
-        with patch('sky.watcher.webhook_config', return_value=('https://example.invalid', 'private')), patch('requests.post', return_value=Mock(status_code=401)):
+        from delivery import Outbox
+        box = Outbox(Path(self.tmp.name) / 'delivery.sqlite', resolve=lambda: {'envoy': ('https://example.invalid', 'private')})
+        self.addCleanup(box.close)
+        self.engine.delivery = box
+        original = box.deliver
+        with patch.object(box, 'deliver', side_effect=lambda payload, background: original(payload, self.now.timestamp())), patch('requests.post', return_value=Mock(status_code=401)):
             with self.assertLogs('sky', level='WARNING') as captured:
                 self.engine.step(self.data, self.now.timestamp(), self.events, self.now)
             self.assertIn('HTTP 401', captured.output[0])
@@ -119,6 +125,64 @@ class Alerts(unittest.TestCase):
         self.engine.step(data_at(viewing.timestamp(), cloud_cover=20), now.timestamp(), [event], now)
         self.assertEqual(len(self.sent), 1)
         self.assertFalse(due(event, now + timedelta(days=1)))
+
+    def test_restart_bad_weather_cancels_persisted_receiver_before_resume(self):
+        from sky.watcher import post
+        from delivery import Outbox
+        enabled = {'envoy': ('envoy', 'private'), 'xai': ('xai', 'private')}
+        calls = []
+        def send(endpoint, payload):
+            calls.append(endpoint[0])
+            return endpoint[0] == 'envoy', 'HTTP 503'
+        path = Path(self.tmp.name) / 'delivery.sqlite'
+        box = Outbox(path, resolve=lambda: dict(enabled), send=send)
+        self.engine.delivery = box
+        self.engine.send = post
+        original = box.deliver
+        with patch.object(box, 'deliver', side_effect=lambda payload, background: original(payload, self.now.timestamp())):
+            self.engine.step(self.data, self.now.timestamp(), self.events, self.now)
+        box.close()
+        enabled.pop('xai')
+        box = Outbox(path, resolve=lambda: dict(enabled), send=send)
+        self.addCleanup(box.close)
+        restarted = Engine(self.path, {}, send=post)
+        restarted.delivery = box
+        later = self.now + timedelta(minutes=1)
+        restarted.step(data_at(self.view, precipitation=1), later.timestamp(), [], later)
+        self.assertFalse(restarted.state['pending'])
+        enabled['xai'] = ('xai', 'rotated')
+        restarted.step(self.data, later.timestamp(), self.events, later)
+        box.drain(later.timestamp())
+        self.assertEqual(calls.count('xai'), 1)
+
+    def test_background_dispatch_cannot_bypass_other_occurrence_weather(self):
+        from sky.watcher import post
+        from delivery import Outbox
+        calls = []
+        box = Outbox(Path(self.tmp.name) / 'delivery.sqlite', resolve=lambda: {'envoy': ('envoy', 'private')},
+                     send=lambda endpoint, payload: calls.append(payload['id']) or (True, 'HTTP 200'))
+        self.addCleanup(box.close)
+        self.engine.send, self.engine.delivery = post, box
+        old = self.now.timestamp() - 60
+        for identity, view in [('first', self.view), ('second', self.view + 60)]:
+            payload = dict(id=identity, kind='sunrise', event='sky_sunrise', name='Sunrise', notify=True,
+                           view_at=datetime.fromtimestamp(view, UTC).isoformat(), useful_until=self.now.timestamp() + 600)
+            self.engine.state['pending'][identity] = dict(payload=payload, expires=payload['useful_until'], forecast_at=old)
+            box.publish(payload)
+        good = sample(self.data, self.view)
+        bad = {**good, 'precipitation': 2}
+        original = box.deliver
+        def dispatch(payload, background):
+            self.assertTrue(background)
+            return original(payload, background=background)  # actual dispatch clock, not step stamp
+        with patch('sky.watcher.F.sample', side_effect=lambda data, view: good if view == self.view else bad), \
+                patch('delivery.time.time', return_value=self.now.timestamp()), patch.object(box, 'deliver', side_effect=dispatch):
+            self.engine.step({}, self.now.timestamp(), [], self.now)
+            for thread in box.workers.values():
+                thread.join(2)
+        self.assertEqual(calls, ['first'])
+        self.assertNotIn('second', self.engine.state['pending'])
+        self.assertEqual(box.diagnostics(), {'accepted': 1, 'cancelled': 1})
 
     def test_quiet_hours_do_not_deliver(self):
         now = datetime(2026, 10, 3, 8, 0, tzinfo=UTC)  # 04:00 ET

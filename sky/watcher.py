@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from runtime import load_config, webhook_config, in_notify_window, atomic_write_json, append_jsonl
 from sky import forecast as F
+from delivery import Outbox
 
 HERE = Path(__file__).resolve().parent
 log = logging.getLogger('sky')
@@ -32,17 +33,11 @@ def due(event, now):
 
 
 def post(payload):
-    import requests
-    url, key = webhook_config()
-    if not url or not key:
-        return False, 'missing webhook configuration'
+    outbox = Outbox(HERE / 'delivery.sqlite')
     try:
-        response = requests.post(url, json=payload, timeout=15, headers={
-            'Authorization': f'Bearer {key}', 'Idempotency-Key': payload['id'],
-            'User-Agent': 'heads-up/2.0'})
-        return 200 <= response.status_code < 300, f'HTTP {response.status_code}'
-    except requests.RequestException as exc:
-        return False, type(exc).__name__
+        return outbox.deliver(payload)
+    finally:
+        outbox.close()
 
 
 class Engine:
@@ -50,6 +45,7 @@ class Engine:
         self.path = Path(state_path)
         self.settings = settings
         self.send = send
+        self.delivery = None
         self.candidate_path = candidate_path
         self.state = json.loads(self.path.read_text()) if self.path.exists() else {'sent': {}, 'pending': {}}
 
@@ -68,13 +64,25 @@ class Engine:
 
     def diagnostics(self):
         return {'failed_pending': sum(bool(item.get('last_error')) for item in self.state['pending'].values()),
-                'failed_expired': self.state.get('failed_expired', [])}
+                'failed_expired': self.state.get('failed_expired', []),
+                'receivers': self.delivery.diagnostics() if self.delivery else {}}
 
     def save(self):
         atomic_write_json(self.path, self.state)
 
+    def cancel(self, key):
+        if self.send is post:
+            self.ledger().cancel(key)
+        del self.state['pending'][key]
+
+    def ledger(self):
+        self.delivery = self.delivery or Outbox(self.path.with_name('delivery.sqlite'))
+        return self.delivery
+
     def step(self, data, fetched_at, events, now):
         stamp = now.timestamp()
+        if self.send is post:
+            self.ledger().sweep(stamp)  # reconcile disabled/expired jobs even without eligible weather
         # Never turn missing or old forecasts into optimistic alerts.
         if 0 <= stamp - fetched_at <= 2 * 3600:
             for original in events:
@@ -97,7 +105,7 @@ class Engine:
                     if good:
                         self.refresh(item, event, weather, score, fetched_at)
                     else:
-                        del self.state['pending'][event['id']]
+                        self.cancel(event['id'])
                     continue
                 if not due(event, now) or event['id'] in self.state['sent']:
                     continue
@@ -123,7 +131,7 @@ class Engine:
                     self.state.setdefault('failed_expired', []).append({'id': key, 'at': stamp,
                         'error': item['last_error'], 'attempts': item.get('attempts', 0)})
                     log.error('Sky delivery expired: %s (%s)', key, item['last_error'])
-                del self.state['pending'][key]
+                self.cancel(key)
                 continue
             if not in_notify_window(stamp):
                 continue
@@ -134,15 +142,16 @@ class Engine:
                 weather = F.sample(data, viewing)
                 score, good = self.qualify(payload['kind'], weather)
                 if not good:
-                    del self.state['pending'][key]
+                    self.cancel(key)
                     continue
                 payload.update(weather=weather, score=score,
                                forecast_at=datetime.fromtimestamp(fetched_at, UTC).isoformat())
                 item['forecast_at'] = fetched_at
-            result = self.send(payload)
+            payload.update(schema_version=1, useful_until=min(item['expires'], item['forecast_at'] + 2 * 3600))
+            result = self.ledger().deliver(payload, background=True) if self.send is post else self.send(payload)
             ok, detail = result if isinstance(result, tuple) else (bool(result), 'delivery rejected')
             item['attempts'] = item.get('attempts', 0) + 1
-            if not ok:
+            if not ok and detail != 'awaiting delivery':
                 if item.get('last_error') != detail:
                     log.warning('Sky delivery failed: %s (%s)', key, detail)
                 item['last_error'] = detail
