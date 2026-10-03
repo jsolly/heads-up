@@ -295,7 +295,7 @@ def send_now(payload, attempts=3):
     """Explicit CLI test; ordinary events are published before asynchronous retry."""
     outbox = Outbox(HERE / 'delivery.sqlite')
     try:
-        return outbox.deliver(payload)
+        return outbox.deliver(payload, require_acceptance=True)
     finally:
         outbox.close()
 
@@ -704,7 +704,7 @@ class Watcher:
         eta_at = datetime.fromisoformat(payload['eta_at']).timestamp() if payload['eta_at'] else None
         lifetime = 15 * 60 if event in ('t60', 't30', 'eta_shift', 'lost_signal') else 30 * 60
         payload.update(id=identity, schema_version=1, useful_until=min(now + lifetime, eta_at)
-                       if eta_at and event not in ('passed', 'stopped_short') else now + lifetime)
+                       if eta_at and event not in ('passed', 'stopped_short', 'lost_signal') else now + lifetime)
         log.info("EVENT %s %s dir=%s dist=%.2fnm eta=%s min=%s", event, payload["name"], payload["direction"],
                  payload["dist_nm"], payload["eta_et"], payload["minutes_out"])
         self.dirty = True

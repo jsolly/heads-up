@@ -18,6 +18,24 @@ def data_at(stamp, **values):
             'daily': {'sunrise': [stamp]}}
 
 
+class FakeDelivery:
+    """Deterministic delivery boundary; production lifecycle uses the same interface."""
+    def __init__(self, send):
+        self.send = send
+
+    def deliver(self, payload, background=False):
+        return self.send(payload)
+
+    def cancel(self, key):
+        pass
+
+    def sweep(self, now):
+        pass
+
+    def diagnostics(self):
+        return {}
+
+
 class Forecast(unittest.TestCase):
     def test_texture_beats_clear_and_low_clouds(self):
         ideal = sample(data_at(100), 100)
@@ -48,7 +66,7 @@ class Alerts(unittest.TestCase):
         self.data = data_at(self.view)
         self.events = sun_events(self.data)
         self.sent = []
-        self.engine = Engine(self.path, {}, send=lambda p: self.sent.append(p) or True)
+        self.engine = Engine(self.path, {}, delivery=FakeDelivery(lambda p: self.sent.append(p) or True))
 
     def test_missing_weather_never_qualifies_at_zero_threshold(self):
         self.engine.settings['sunrise_threshold'] = 0
@@ -57,8 +75,6 @@ class Alerts(unittest.TestCase):
 
     def test_failed_delivery_remains_visible_after_expiry(self):
         from unittest.mock import patch, Mock
-        from sky.watcher import post
-        self.engine.send = post
         from delivery import Outbox
         box = Outbox(Path(self.tmp.name) / 'delivery.sqlite', resolve=lambda: {'envoy': ('https://example.invalid', 'private')})
         self.addCleanup(box.close)
@@ -72,13 +88,13 @@ class Alerts(unittest.TestCase):
         self.assertEqual(self.engine.diagnostics()['failed_pending'], 1)
         with self.assertLogs('sky', level='ERROR'):
             self.engine.step(self.data, self.now.timestamp(), [], self.now + timedelta(minutes=16))
-        restarted = Engine(self.path, {})
+        restarted = Engine(self.path, {}, delivery=FakeDelivery(lambda _: True))
         self.assertEqual(restarted.diagnostics()['failed_expired'][0]['error'], 'HTTP 401')
         self.assertEqual(restarted.diagnostics()['failed_pending'], 0)
 
     def test_due_and_dedup_after_restart(self):
         self.engine.step(self.data, self.now.timestamp(), self.events, self.now)
-        Engine(self.path, {}, send=lambda p: self.sent.append(p) or True).step(
+        Engine(self.path, {}, delivery=FakeDelivery(lambda p: self.sent.append(p) or True)).step(
             self.data, self.now.timestamp(), self.events, self.now + timedelta(minutes=1))
         self.assertEqual(len(self.sent), 1)
         self.assertNotIn('lat', self.sent[0])
@@ -91,17 +107,17 @@ class Alerts(unittest.TestCase):
 
     def test_failed_send_retries_across_restart_same_id(self):
         attempted = []
-        self.engine.send = lambda p: attempted.append(p['id']) or False
+        self.engine.delivery = FakeDelivery(lambda p: attempted.append(p['id']) or False)
         self.engine.step(self.data, self.now.timestamp(), self.events, self.now)
-        self.engine = Engine(self.path, {}, send=lambda p: attempted.append(p['id']) or True)
+        self.engine = Engine(self.path, {}, delivery=FakeDelivery(lambda p: attempted.append(p['id']) or True))
         self.engine.step(self.data, self.now.timestamp(), self.events, self.now + timedelta(minutes=1))
         self.assertEqual(attempted, [self.events[0]['id']] * 2)
         self.assertFalse(self.engine.state['pending'])
 
     def test_weather_deteriorates_before_retry(self):
-        self.engine.send = lambda _: False
+        self.engine.delivery = FakeDelivery(lambda _: False)
         self.engine.step(self.data, self.now.timestamp(), self.events, self.now)
-        self.engine.send = lambda p: self.sent.append(p) or True
+        self.engine.delivery = FakeDelivery(lambda p: self.sent.append(p) or True)
         later = self.now + timedelta(minutes=1)
         self.engine.step(data_at(self.view, precipitation=1), later.timestamp(), [], later)
         self.assertEqual(self.sent, [])
@@ -110,9 +126,9 @@ class Alerts(unittest.TestCase):
     def test_stale_forecast_and_expired_outbox(self):
         self.engine.step(self.data, self.now.timestamp() - 7201, self.events, self.now)
         self.assertEqual(self.sent, [])
-        self.engine.send = lambda _: False
+        self.engine.delivery = FakeDelivery(lambda _: False)
         self.engine.step(self.data, self.now.timestamp(), self.events, self.now)
-        self.engine.send = lambda p: self.sent.append(p) or True
+        self.engine.delivery = FakeDelivery(lambda p: self.sent.append(p) or True)
         self.engine.step(self.data, self.now.timestamp(), [], self.now + timedelta(minutes=91))
         self.assertEqual(self.sent, [])
         self.assertFalse(self.engine.state['pending'])
@@ -127,7 +143,6 @@ class Alerts(unittest.TestCase):
         self.assertFalse(due(event, now + timedelta(days=1)))
 
     def test_restart_bad_weather_cancels_persisted_receiver_before_resume(self):
-        from sky.watcher import post
         from delivery import Outbox
         enabled = {'envoy': ('envoy', 'private'), 'xai': ('xai', 'private')}
         calls = []
@@ -137,7 +152,6 @@ class Alerts(unittest.TestCase):
         path = Path(self.tmp.name) / 'delivery.sqlite'
         box = Outbox(path, resolve=lambda: dict(enabled), send=send)
         self.engine.delivery = box
-        self.engine.send = post
         original = box.deliver
         with patch.object(box, 'deliver', side_effect=lambda payload, background: original(payload, self.now.timestamp())):
             self.engine.step(self.data, self.now.timestamp(), self.events, self.now)
@@ -145,8 +159,7 @@ class Alerts(unittest.TestCase):
         enabled.pop('xai')
         box = Outbox(path, resolve=lambda: dict(enabled), send=send)
         self.addCleanup(box.close)
-        restarted = Engine(self.path, {}, send=post)
-        restarted.delivery = box
+        restarted = Engine(self.path, {}, delivery=box)
         later = self.now + timedelta(minutes=1)
         restarted.step(data_at(self.view, precipitation=1), later.timestamp(), [], later)
         self.assertFalse(restarted.state['pending'])
@@ -156,13 +169,12 @@ class Alerts(unittest.TestCase):
         self.assertEqual(calls.count('xai'), 1)
 
     def test_background_dispatch_cannot_bypass_other_occurrence_weather(self):
-        from sky.watcher import post
         from delivery import Outbox
         calls = []
         box = Outbox(Path(self.tmp.name) / 'delivery.sqlite', resolve=lambda: {'envoy': ('envoy', 'private')},
                      send=lambda endpoint, payload: calls.append(payload['id']) or (True, 'HTTP 200'))
         self.addCleanup(box.close)
-        self.engine.send, self.engine.delivery = post, box
+        self.engine.delivery = box
         old = self.now.timestamp() - 60
         for identity, view in [('first', self.view), ('second', self.view + 60)]:
             payload = dict(id=identity, kind='sunrise', event='sky_sunrise', name='Sunrise', notify=True,
@@ -205,11 +217,11 @@ class CelestialIdentity(unittest.TestCase):
         sent = []
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'state.json'
-            engine = Engine(path, {}, send=lambda p: sent.append(p) or True)
+            engine = Engine(path, {}, delivery=FakeDelivery(lambda p: sent.append(p) or True))
             engine.step(data_at(viewing.timestamp(), cloud_cover=20), now.timestamp(),
                         [event('iss', 'ISS pass', viewing, 'Celestrak', '')], now)
             later = viewing + timedelta(seconds=40)
-            engine = Engine(path, {}, send=lambda p: sent.append(p) or True)
+            engine = Engine(path, {}, delivery=FakeDelivery(lambda p: sent.append(p) or True))
             engine.step(data_at(later.timestamp(), cloud_cover=20), now.timestamp(),
                         [event('iss', 'ISS pass', later, 'Celestrak', '')], now)
             self.assertEqual(len(sent), 1)
@@ -221,11 +233,11 @@ class CelestialIdentity(unittest.TestCase):
         sent = []
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'state.json'
-            engine = Engine(path, {}, send=lambda p: False)
+            engine = Engine(path, {}, delivery=FakeDelivery(lambda p: False))
             original = event('iss', 'ISS pass', viewing, 'Celestrak', '', altitude_deg=30)
             engine.step(data_at(viewing.timestamp(), cloud_cover=20), now.timestamp(), [original], now)
             later = viewing + timedelta(minutes=10)
-            engine = Engine(path, {}, send=lambda p: sent.append(p) or True)
+            engine = Engine(path, {}, delivery=FakeDelivery(lambda p: sent.append(p) or True))
             fresh = event('iss', 'ISS pass', later, 'Celestrak', '', altitude_deg=50)
             engine.step(data_at(later.timestamp(), cloud_cover=10), now.timestamp(), [fresh], now)
             self.assertEqual(len(sent), 1)

@@ -105,6 +105,34 @@ class Delivery(unittest.TestCase):
         self.box.deliver(self.payload, NOW)
         self.assertEqual(self.calls, [])
 
+    def test_explicit_test_requires_receivers_and_acceptance(self):
+        self.enabled.clear()
+        self.assertEqual(self.box.deliver(self.payload, NOW, require_acceptance=True),
+                         (False, 'no enabled destinations'))
+        self.enabled['envoy'] = ('envoy', 'private')
+        active = {**self.payload, 'id': 'active'}
+        self.assertEqual(self.box.deliver(active, NOW, require_acceptance=True),
+                         (True, 'receiver accepted'))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_explicit_test_rejects_partial_cancelled_and_expired(self):
+        self.assertFalse(self.box.deliver(self.payload, NOW, require_acceptance=True)[0])
+        self.enabled.pop('xai')
+        self.assertEqual(self.box.deliver(self.payload, NOW + 6, require_acceptance=True),
+                         (False, 'delivery cancelled'))
+        self.assertTrue(self.box.deliver(self.payload, NOW + 6)[0])
+        expired = {**self.payload, 'id': 'expired', 'useful_until': NOW}
+        self.assertEqual(self.box.deliver(expired, NOW, require_acceptance=True),
+                         (False, 'delivery expired'))
+        self.assertEqual([name for name, _ in self.calls].count('envoy'), 1)
+
+    def test_explicit_test_during_quiet_hours_is_not_acceptance(self):
+        quiet = datetime(2026, 10, 3, 4, tzinfo=ET).timestamp()
+        payload = {**self.payload, 'useful_until': quiet + 600}
+        self.assertEqual(self.box.deliver(payload, quiet, require_acceptance=True),
+                         (False, 'awaiting delivery'))
+        self.assertEqual(self.calls, [])
+
     def test_second_event_reaches_healthy_destination_while_first_stalls(self):
         import time
         entered, release, first, second = (threading.Event() for _ in range(4))
@@ -192,6 +220,15 @@ class Delivery(unittest.TestCase):
 
 
 class Publication(unittest.TestCase):
+    def test_cli_send_without_destination_fails(self):
+        from ships import watcher as W
+        with tempfile.TemporaryDirectory() as temporary:
+            def open_box(path):
+                return Outbox(path, resolve=lambda: {})
+            with patch.object(W, 'HERE', Path(temporary)), patch.object(W, 'Outbox', side_effect=open_box):
+                self.assertEqual(W.send_now(dict(id='test', notify=True, useful_until=NOW + 600)),
+                                 (False, 'no enabled destinations'))
+
     def test_ship_intent_survives_crash_before_and_after_queue_publication(self):
         from ships import watcher as W
         with tempfile.TemporaryDirectory() as temporary:

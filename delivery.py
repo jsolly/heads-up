@@ -186,7 +186,7 @@ class Outbox:
             self.db.executemany('DELETE FROM deliveries WHERE event_id=?', keys)
             self.db.executemany('DELETE FROM events WHERE id=?', keys)
 
-    def deliver(self, payload, now=None, background=False):
+    def deliver(self, payload, now=None, background=False, require_acceptance=False):
         ok, detail = self.publish(payload)
         if not ok:
             return ok, detail
@@ -198,6 +198,13 @@ class Outbox:
         pending = [detail or 'awaiting delivery' for status, detail in statuses if status == 'pending']
         if any(status == 'expired' for status, _ in statuses):
             return False, 'delivery expired'
+        if require_acceptance:
+            if not statuses:
+                return False, 'no enabled destinations'
+            if any(status == 'cancelled' for status, _ in statuses):
+                return False, 'delivery cancelled'
+            if not pending:
+                return True, 'receiver accepted'
         return not pending, pending[0] if pending else 'destinations terminal'
 
     def diagnostics(self):

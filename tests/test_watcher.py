@@ -1,5 +1,6 @@
 """Unit tests. Run: python3 -m unittest discover -s tests -v"""
 import json
+from datetime import datetime
 import sys
 import tempfile
 import unittest
@@ -213,8 +214,62 @@ class Transit(unittest.TestCase):
             self.w.periodic(now=t + minute * 60)
         kinds = [e["event"] for e in self.events]
         self.assertEqual(kinds.count("lost_signal"), 1)
+        lost = next(item for item in self.events if item['event'] == 'lost_signal')
+        detected = datetime.fromisoformat(lost['ts']).timestamp()
+        self.assertLess(datetime.fromisoformat(lost['eta_at']).timestamp(), detected)
+        self.assertEqual(lost['useful_until'], detected + 15 * 60)
         self.pos(t + 96 * 60, 39.856, -75.243, 10, 80)
         self.assertTrue(self.w.state["ships"]["123456789"]["transit"]["signal_back"])
+
+    def test_transit_ledger_ids_expiry_and_restart(self):
+        from delivery import Outbox
+        start = datetime(2026, 10, 3, 12, tzinfo=W.ET).timestamp()
+        path = Path(self.tmp.name) / 'delivery.sqlite'
+        calls = []
+        def send(endpoint, body):
+            calls.append(dict(body))
+            return True, 'HTTP 200'
+        def open_box():
+            return Outbox(path, resolve=lambda: {'envoy': ('envoy', 'private')}, send=send)
+        box = open_box()
+        self.addCleanup(lambda: box.close())
+        outer = self
+        class Ledger:
+            def submit(self, payload):
+                outer.events.append(dict(payload))
+                box.publish(payload)
+                box.drain(datetime.fromisoformat(payload['ts']).timestamp())
+        self.w.sender = Ledger()
+        self.static()
+        midpoint = self.run_track(self.channel_track(10, 16), t0=start)
+        transit_id = self.w.state['ships']['123456789']['transit']['id']
+        self.w.save(force=True)
+        first = self.events[0]
+        # Persist a duplicate publication intent as if acknowledgement was lost.
+        state = json.loads(W.STATE_PATH.read_text())
+        state['publication_pending'][first['id']] = first
+        W.STATE_PATH.write_text(json.dumps(state))
+        box.close()
+        box = open_box()
+        self.w = W.Watcher(Ledger())
+        self.assertEqual(self.events[-1], first)
+        self.assertEqual(calls.count(first), 1)
+        self.run_track(self.channel_track(16, 30), t0=midpoint)
+        rows = [json.loads(row[0]) for row in box.db.execute('SELECT body FROM events ORDER BY rowid')]
+        kinds = [row['event'] for row in rows]
+        for kind in ('new_ship', 't60', 't30', 'passed'):
+            self.assertEqual(kinds.count(kind), 1)
+        sequences = [int(row['id'].rsplit(':', 1)[1]) for row in rows]
+        self.assertEqual(sequences, sorted(set(sequences)))
+        self.assertTrue(all(row['id'].startswith('ship:' + transit_id + ':') for row in rows))
+        for row in rows:
+            self.assertEqual(calls.count(row), 1)
+            if row['event'] in ('t60', 't30'):
+                detected = datetime.fromisoformat(row['ts']).timestamp()
+                eta = datetime.fromisoformat(row['eta_at']).timestamp()
+                self.assertGreater(row['useful_until'], detected)
+                self.assertEqual(row['useful_until'], min(eta, detected + 15 * 60))
+        self.assertFalse(self.w.state['publication_pending'])
 
 
 class Policy(unittest.TestCase):
